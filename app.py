@@ -5,6 +5,19 @@ import re
 from google.oauth2.service_account import Credentials
 
 # ========================
+# Función para autorizar gspread usando st.secrets
+# ========================
+def authorize_gspread():
+    # Obtiene las credenciales desde st.secrets
+    creds_dict = st.secrets["gcp_service_account"]
+    credentials = Credentials.from_service_account_info(
+        creds_dict,
+        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    )
+    client = gspread.authorize(credentials)
+    return client
+
+# ========================
 # Funciones para simplificar la dirección
 # ========================
 def simplify_address_15chars(address):
@@ -34,30 +47,25 @@ def simplify_address_basic(address):
 # ========================
 # Función principal de procesamiento
 # ========================
-def process_files(json_path, igms_csv_path, apply_15chars, order_by_cleaner):
+def process_files(igms_csv_file, apply_15chars, order_by_cleaner):
     try:
-        # 1. Autenticación en Google Sheets
-        credentials = Credentials.from_service_account_file(
-            json_path,
-            scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets"]
-        )
-        client = gspread.authorize(credentials)
-        
-        # 2. Cargar la hoja "Key Register"
-        sheet = client.open_by_key('1AEX3jKwAdO5cROqTe6k4uNv7BCy7lPOKHrGQjZA3om0').worksheet('Key Register')
+        # Autorizar gspread usando st.secrets
+        client = authorize_gspread()
+        # Usar el spreadsheet_id definido en st.secrets
+        spreadsheet_id = st.secrets["gcp_service_account"].get("spreadsheet_id", "YOUR_SPREADSHEET_ID")
+        sheet = client.open_by_key(spreadsheet_id).worksheet("Key Register")
         data = sheet.get_all_values()
         
-        # 3. Crear DataFrame de llaves (fila 1 = encabezados, filas 2+ = datos)
+        # Crear DataFrame de llaves (la fila 1 tiene encabezados, filas 2+ datos)
         df_keys = pd.DataFrame(data[2:], columns=data[1])
         df_keys = df_keys.drop(columns='', errors='ignore')
-        
-        # 4. Filtrar llaves disponibles (donde "Observation" esté vacío)
+        # Filtrar llaves disponibles (Observation vacío o NaN)
         df_keys_available = df_keys[(df_keys["Observation"].isna()) | (df_keys["Observation"].str.strip() == "")]
         
-        # 5. Cargar CSV IGMS
-        df_igms = pd.read_csv(igms_csv_path)
+        # Leer el CSV de IGMS (archivo subido)
+        df_igms = pd.read_csv(igms_csv_file)
         
-        # 6. Crear la columna "Simplified Address" en ambos DataFrames
+        # Crear la columna "Simplified Address" en ambos DataFrames
         if apply_15chars:
             df_igms["Simplified Address"] = df_igms["Property Nickname"].apply(
                 lambda x: simplify_address_15chars(x.split('-')[0])
@@ -73,7 +81,7 @@ def process_files(json_path, igms_csv_path, apply_15chars, order_by_cleaner):
                 lambda x: simplify_address_basic(x)
             )
         
-        # 7. Merge entre IGMS y llaves disponibles
+        # Merge entre IGMS y llaves disponibles
         df_merged = pd.merge(
             df_igms,
             df_keys_available,
@@ -82,28 +90,24 @@ def process_files(json_path, igms_csv_path, apply_15chars, order_by_cleaner):
             suffixes=('_IGMS', '_Key')
         )
         
-        # 8. Crear la columna "M_Key": asigna la llave (columna "Tag") si empieza con "M"
+        # Crear la columna "M_Key": asigna la llave (columna "Tag") si empieza con "M"
         df_merged["M_Key"] = df_merged.apply(
             lambda row: row["Tag"] if pd.notna(row["Tag"]) and row["Tag"].strip().startswith("M") else "",
             axis=1
         )
         
-        # 9. Seleccionar columnas de interés para el reporte final
+        # Seleccionar columnas de interés
         df_result = df_merged[[ 
-            "Property Nickname",   # Desde IGMS
-            "Cleaner",             # Desde IGMS
+            "Property Nickname",   # IGMS
+            "Cleaner",             # IGMS
             "M_Key",               # Llave M
-            "Simplified Address"   # Para referencia
+            "Simplified Address"   # Referencia
         ]]
-        
-        # Rellenar valores NaN en "Cleaner" para ordenar
         df_result["Cleaner"] = df_result["Cleaner"].fillna("")
         
-        # 10. Ordenar según la opción del usuario
+        # Ordenar según la opción del usuario
         sort_column = "Cleaner" if order_by_cleaner else "Property Nickname"
         df_result_sorted = df_result.sort_values(by=sort_column, na_position="first")
-        
-        # 11. Renombrar columnas para un Excel más amigable
         df_result_sorted = df_result_sorted.rename(columns={
             "Property Nickname": "Propiedad",
             "Cleaner": "Responsable",
@@ -111,15 +115,11 @@ def process_files(json_path, igms_csv_path, apply_15chars, order_by_cleaner):
             "Simplified Address": "Direccion Simplificada"
         })
         
-        # 12. Exportar el resultado a CSV
-        output_csv = 'resultado_llaves_m_sorted.csv'
-        df_result_sorted.to_csv(output_csv, index=False)
-        
+        csv_bytes = df_result_sorted.to_csv(index=False).encode('utf-8')
         result_str = df_result_sorted.to_string(index=False, max_rows=None)
-        return df_result_sorted, result_str, f"Proceso completado. Resultado exportado a '{output_csv}'."
-    
+        return df_result_sorted, csv_bytes, result_str, "Proceso completado."
     except Exception as e:
-        return None, "", f"Error al procesar: {str(e)}"
+        return None, None, "", f"Error al procesar: {e}"
 
 # ========================
 # Función para generar reporte agrupado
@@ -136,7 +136,7 @@ def generate_grouped_report(df_result_sorted):
     })
     df_grouped = df_grouped.sort_values(by=["Responsable", "Propiedad"], na_position="first")
     
-    output_xlsx = 'resultado_llaves_m_grouped.xlsx'
+    output_xlsx = "resultado_llaves_m_grouped.xlsx"
     with pd.ExcelWriter(output_xlsx, engine="xlsxwriter") as writer:
         df_grouped.to_excel(writer, sheet_name="Reporte", index=False)
         workbook = writer.book
@@ -164,39 +164,33 @@ def generate_grouped_report(df_result_sorted):
         worksheet.set_column(1, 1, 20, cell_format)  # Responsable
         worksheet.set_column(2, 2, 40, cell_format)  # Direccion Simplificada
         worksheet.set_column(3, 3, 30, cell_format)  # Llave M
-    
-    return output_xlsx, df_grouped.to_string(index=False, max_rows=None)
+    with open(output_xlsx, "rb") as f:
+        xlsx_data = f.read()
+    grouped_str = df_grouped.to_string(index=False, max_rows=None)
+    return output_xlsx, xlsx_data, grouped_str
 
 # ========================
 # Interfaz con Streamlit
 # ========================
-def main():
-    st.title("Procesador de Llaves M")
-    
-    st.markdown("### Ingrese la ruta de su archivo de credenciales JSON")
-    json_path = st.text_input("Ruta del archivo JSON de credenciales")
-    
-    st.markdown("### Ingrese la ruta de su archivo CSV IGMS")
-    igms_csv_path = st.text_input("Ruta del archivo CSV IGMS")
-    
-    apply_15chars = st.checkbox("Aplicar 15 caracteres desde el primer dígito", value=True)
-    order_option = st.radio("Ordenar por:", ("Cleaner", "Nombre Propiedad"))
-    order_by_cleaner = True if order_option == "Cleaner" else False
-    grouped = st.checkbox("Generar reporte agrupado (una fila por unidad)", value=True)
-    
-    if st.button("Procesar"):
-        if not json_path or not igms_csv_path:
-            st.error("Por favor, ingrese ambas rutas de archivos.")
-        else:
-            with st.spinner("Procesando..."):
-                df_result_sorted, result_str, msg = process_files(json_path, igms_csv_path, apply_15chars, order_by_cleaner)
-                st.success(msg)
-                st.text_area("Resultado Plano", result_str, height=300)
-                
-                if grouped and df_result_sorted is not None:
-                    output_xlsx, grouped_str = generate_grouped_report(df_result_sorted)
-                    st.success(f"Reporte agrupado exportado a '{output_xlsx}'")
-                    st.text_area("Reporte Agrupado", grouped_str, height=300)
+st.title("Procesador de Llaves M")
 
-if __name__ == "__main__":
-    main()
+st.markdown("### Subir archivo CSV IGMS")
+csv_file = st.file_uploader("Selecciona el archivo CSV", type=["csv"])
+
+apply_15chars = st.checkbox("Aplicar 15 caracteres desde el primer dígito", value=True)
+order_option = st.radio("Ordenar por:", ("Cleaner", "Nombre Propiedad"))
+order_by_cleaner = True if order_option == "Cleaner" else False
+grouped = st.checkbox("Generar reporte agrupado (una fila por unidad)", value=True)
+
+if st.button("Procesar"):
+    if csv_file is None:
+        st.error("Por favor, sube el archivo CSV IGMS.")
+    else:
+        df_result_sorted, csv_bytes, result_str, msg = process_files(csv_file, apply_15chars, order_by_cleaner)
+        st.success(msg)
+        st.text_area("Resultado Plano", result_str, height=300)
+        st.download_button(label="Descargar CSV", data=csv_bytes, file_name="resultado_llaves_m_sorted.csv", mime="text/csv")
+        if grouped and df_result_sorted is not None:
+            output_xlsx, xlsx_bytes, grouped_str = generate_grouped_report(df_result_sorted)
+            st.text_area("Reporte Agrupado", grouped_str, height=300)
+            st.download_button(label="Descargar Excel Agrupado", data=xlsx_bytes, file_name="resultado_llaves_m_grouped.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
