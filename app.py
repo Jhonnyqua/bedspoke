@@ -194,4 +194,4 @@ if st.button("Procesar"):
             output_xlsx, xlsx_bytes, grouped_str = generate_grouped_report(df_result_sorted)
             st.text_area("Reporte Agrupado", grouped_str, height=300)
             st.download_button(label="Descargar Excel Agrupado", data=xlsx_bytes, file_name="resultado_llaves_m_grouped.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") 
-git
+            
