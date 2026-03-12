@@ -185,11 +185,6 @@ def looks_like_address_start(line: str) -> bool:
     if is_date_stay_line(line):
         return False
 
-    # Ejemplos:
-    # 11/484 Upper Edward Street
-    # 2002/191 Brunswick Street
-    # A71/41 Gotha Street
-    # 24 Church Street
     starts_like_property = bool(
         re.match(r"^[A-Za-z]?\d+[A-Za-z]?(?:/\d+[A-Za-z]?)?", line)
     )
@@ -269,9 +264,14 @@ def build_address(lines, start_idx):
 
 
 # ----------------------------------------------------------
-# 6. DETECCIÓN DE NOMBRE
+# 6. DETECCIÓN DE NOMBRE DEL CLEANER
 # ----------------------------------------------------------
 def is_cleaner_name_line(line: str) -> bool:
+    """
+    Detecta si una línea es un nombre de persona (cleaner/housekeeper).
+    En el PDF, el nombre aparece AL FINAL del bloque de cada propiedad,
+    justo antes de la siguiente dirección.
+    """
     line = clean_line(line)
 
     if not line:
@@ -289,7 +289,7 @@ def is_cleaner_name_line(line: str) -> bool:
     if is_date_stay_line(line):
         return False
 
-    # Excluir líneas con números
+    # Excluir líneas con números (fechas, precios, etc.)
     if re.search(r"\d", line):
         return False
 
@@ -317,59 +317,47 @@ def is_cleaner_name_line(line: str) -> bool:
         "back to back",
         "due",
         "eta",
+        "please",
+        "return",
+        "bring",
+        "important",
+        "deep clean",
+        "feedback",
     ]
     low = line.lower()
     if any(x in low for x in banned_fragments):
         return False
 
-    if not re.fullmatch(r"[A-Za-zÀ-ÿ'’\- ]+", line):
+    # Solo letras, espacios, apóstrofes y guiones
+    if not re.fullmatch(r"[A-Za-zÀ-ÿ''\- ]+", line):
         return False
 
     words = line.split()
     return 1 <= len(words) <= 6
 
 
-def extract_cleaner_above_address(lines, start_idx):
+def extract_cleaner_from_lines(candidate_lines: list) -> str:
     """
-    Busca el cleaner inmediatamente ARRIBA de la dirección.
-    En este PDF, el assigned person suele venir justo antes de la address.
+    Dado un conjunto de líneas que están entre el fin del bloque de una propiedad
+    y el inicio de la siguiente dirección, extrae el nombre del cleaner.
+    Los nombres pueden ocupar 1-3 líneas (ej: "Brenda Anahi" / "Bedon").
     """
-    parts = []
-    i = start_idx - 1
+    name_parts = []
 
-    # saltar basura operativa justo antes de la dirección
-    while i >= 0:
-        line = clean_line(lines[i])
-
-        if not line or is_footer_or_header(line):
-            i -= 1
-            continue
-
-        if is_operation_line(line) or is_guest_line(line) or is_date_stay_line(line):
-            i -= 1
-            continue
-
-        break
-
-    # recoger 1 a 4 líneas de nombre hacia arriba
-    while i >= 0:
-        line = clean_line(lines[i])
-
+    # Recorrer en orden (el nombre viene al final, antes de la siguiente dirección)
+    # Filtramos solo las líneas que parecen nombres
+    for line in candidate_lines:
+        line = clean_line(line)
         if is_cleaner_name_line(line):
-            parts.insert(0, line)
-            i -= 1
-            if len(parts) >= 4:
-                break
-        else:
-            break
+            name_parts.append(line)
 
-    cleaner = " ".join(parts)
-    cleaner = re.sub(r"\s{2,}", " ", cleaner).strip()
-
-    if not cleaner:
+    if not name_parts:
         return "Unassigned"
 
-    return cleaner
+    # Unir las partes del nombre
+    cleaner = " ".join(name_parts)
+    cleaner = re.sub(r"\s{2,}", " ", cleaner).strip()
+    return cleaner if cleaner else "Unassigned"
 
 
 # ----------------------------------------------------------
@@ -379,33 +367,57 @@ def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
     text = extract_text_from_pdf(pdf_file)
     raw_lines = text.splitlines()
 
+    # Limpiamos pero SIN filtrar headers/footers todavía para no perder estructura
     lines = []
     for line in raw_lines:
         line = clean_line(line)
         if not line:
             continue
-        if is_footer_or_header(line):
-            continue
         lines.append(line)
 
-    rows = []
+    # Identificar posiciones de todas las direcciones
+    address_positions = []
     i = 0
-
     while i < len(lines):
-        line = lines[i]
-
-        if looks_like_address_start(line):
+        if looks_like_address_start(lines[i]):
             address, next_i = build_address(lines, i)
-            cleaner = extract_cleaner_above_address(lines, i)
-
-            rows.append({
-                "Cleaner": cleaner,
-                "Property Nickname": address
+            address_positions.append({
+                "address": address,
+                "start": i,
+                "end": next_i,
             })
-
             i = next_i
         else:
             i += 1
+
+    rows = []
+
+    for idx, entry in enumerate(address_positions):
+        address = entry["address"]
+        end_of_address = entry["end"]
+
+        # El cleaner está en las líneas ENTRE el fin de este bloque
+        # y el inicio de la siguiente dirección (o fin del documento).
+        if idx + 1 < len(address_positions):
+            next_address_start = address_positions[idx + 1]["start"]
+        else:
+            next_address_start = len(lines)
+
+        # Líneas entre end_of_address y next_address_start
+        block_lines = lines[end_of_address:next_address_start]
+
+        # Filtrar headers/footers de ese bloque
+        block_lines_clean = [
+            l for l in block_lines
+            if not is_footer_or_header(l)
+        ]
+
+        cleaner = extract_cleaner_from_lines(block_lines_clean)
+
+        rows.append({
+            "Cleaner": cleaner,
+            "Property Nickname": address,
+        })
 
     df = pd.DataFrame(rows)
 
@@ -413,10 +425,8 @@ def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
         return df
 
     df = df.drop_duplicates()
-
     df["Cleaner"] = df["Cleaner"].fillna("Unassigned").astype(str).str.strip()
     df["Property Nickname"] = df["Property Nickname"].fillna("").astype(str).str.strip()
-
     df = df[df["Property Nickname"] != ""]
 
     return df
