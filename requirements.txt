@@ -1,6 +1,7 @@
-pypdf
-xlsxwriter
-gspread
-google-auth
-pandas
-streamlit
+streamlit==1.31.1
+altair==4.2.2
+pandas==2.2.2
+gspread==6.1.2
+google-auth==2.29.0
+pypdf==4.2.0
+xlsxwriter==3.2.0
