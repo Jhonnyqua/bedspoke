@@ -61,41 +61,42 @@ def simplify_address_15chars(address: str) -> str:
 # EXTRAER CAJAS DE TEXTO CON COORDENADAS
 # ----------------------------------------------------------
 def extract_boxes(pdf_file) -> list:
-    """
-    Returns all text boxes with page, x0, y1, x0_pct, text.
-    Text within each box has newlines replaced with spaces.
-    """
     laparams = LAParams(line_margin=0.5, char_margin=3.0, word_margin=0.1)
     boxes = []
     for page_num, page_layout in enumerate(extract_pages(pdf_file, laparams=laparams)):
         page_width = page_layout.width
+        page_height = page_layout.height
         for element in page_layout:
             if isinstance(element, LTTextBox):
                 text = element.get_text().strip()
                 if not text:
                     continue
-                # Normalize internal newlines to spaces
-                text = re.sub(r"\s*\n\s*", " ", text).strip()
+                text_clean = re.sub(r"\s*\n\s*", " ", text).strip()
                 boxes.append({
                     "page": page_num,
+                    "page_height": page_height,
                     "x0": element.x0,
-                    "y1": element.y1,   # top of box (higher = higher on page)
+                    "y1": element.y1,
                     "x0_pct": element.x0 / page_width * 100,
-                    "text": text,
+                    "text": text_clean,
                 })
     return boxes
+
+
+# ----------------------------------------------------------
+# CONVERTIR (page, y1) A POSICIÓN ABSOLUTA EN EL DOCUMENTO
+# Para comparar posiciones entre páginas distintas
+# ----------------------------------------------------------
+def abs_position(page: int, y1: float, page_height: float) -> float:
+    """Higher value = earlier in document (page 0 top > page 1 top)."""
+    return page * 10000 + (page_height - y1)
 
 
 # ----------------------------------------------------------
 # LIMPIAR TEXTO DE DIRECCIÓN
 # ----------------------------------------------------------
 def clean_address_text(text: str) -> str:
-    """
-    Address boxes contain only the address lines separated by spaces.
-    Remove any trailing operational text just in case.
-    """
     text = re.sub(r"\s+", " ", text).strip()
-    # Cut at postcode if present
     m = re.search(r"\b([2-9]\d{3})\b", text)
     if m:
         text = text[:m.start() + 4].strip()
@@ -103,7 +104,6 @@ def clean_address_text(text: str) -> str:
 
 
 def is_valid_address(text: str) -> bool:
-    """Check if text looks like a property address."""
     if not re.match(r"^[A-Za-z]?\d+[A-Za-z]?(?:/\d+[A-Za-z]?)?", text):
         return False
     return any(k.lower() in text.lower() for k in STREET_KEYWORDS)
@@ -113,7 +113,6 @@ def is_valid_address(text: str) -> bool:
 # LIMPIAR TEXTO DE CLEANER
 # ----------------------------------------------------------
 def is_cleaner_name_word(word: str) -> bool:
-    """Check if a single word could be part of a cleaner name."""
     if not word:
         return False
     if re.search(r"\d", word):
@@ -124,22 +123,12 @@ def is_cleaner_name_word(word: str) -> bool:
 
 
 def extract_cleaner_from_text(text: str) -> str:
-    """
-    From the right-column text box, extract the cleaner name.
-    The box may contain: 'Thomas Clarisse' or 'Brenda Anahi Bedon'
-    It may also contain noise from the Reservation column bleeding in.
-    We take only words that look like name words (letters only, no digits).
-    Stop at first line that looks like a guest entry or date.
-    """
-    # Split on pipe separators or newlines that pdfminer may produce
     parts = re.split(r"\s*\|\s*|\n", text)
-    
     name_words = []
     for part in parts:
         part = part.strip()
         if not part:
             continue
-        # Stop if this looks like a guest line (SURNAME, Firstname format)
         if re.search(r"\([0-9]+A[0-9]+C\)", part):
             break
         if re.search(r"\d{2}/\d{2}/\d{4}", part):
@@ -148,20 +137,19 @@ def extract_cleaner_from_text(text: str) -> str:
             break
         if "," in part:
             break
-        # Check banned words
         low = part.lower()
         banned = False
         for word in BANNED_NAME_WORDS:
             if re.search(r"\b" + re.escape(word) + r"\b", low):
                 banned = True
                 break
-        for phrase in BANNED_NAME_PHRASES:
-            if phrase in low:
-                banned = True
-                break
+        if not banned:
+            for phrase in BANNED_NAME_PHRASES:
+                if phrase in low:
+                    banned = True
+                    break
         if banned:
             break
-        # Only keep if all words are name-like
         words = part.split()
         if all(is_cleaner_name_word(w) for w in words) and 1 <= len(words) <= 4:
             name_words.extend(words)
@@ -179,54 +167,53 @@ def extract_cleaner_from_text(text: str) -> str:
 def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
     boxes = extract_boxes(pdf_file)
 
-    # Separate into address boxes (x0_pct < 15%) and cleaner boxes (x0_pct > 75%)
-    address_boxes = []
-    cleaner_boxes = []
+    address_list = []  # {abs_pos, address}
+    cleaner_list = []  # {abs_pos, cleaner}
 
     for box in boxes:
         pct = box["x0_pct"]
         text = box["text"]
+        apos = abs_position(box["page"], box["y1"], box["page_height"])
 
         if pct < 15:
-            # Left column — check if it's a valid address
             cleaned = clean_address_text(text)
             if is_valid_address(cleaned):
-                address_boxes.append({
-                    "page": box["page"],
-                    "y1": box["y1"],
-                    "address": cleaned,
-                })
+                address_list.append({"abs_pos": apos, "address": cleaned})
 
-        elif pct > 75:
-            # Right column — potential cleaner name
+        elif pct > 70:
             cleaner = extract_cleaner_from_text(text)
             if cleaner != "Unassigned":
-                cleaner_boxes.append({
-                    "page": box["page"],
-                    "y1": box["y1"],
-                    "cleaner": cleaner,
-                })
+                cleaner_list.append({"abs_pos": apos, "cleaner": cleaner})
 
-    # Match each address to the nearest cleaner box by (page, y1)
+    # Sort both lists by document position
+    address_list.sort(key=lambda x: x["abs_pos"])
+    cleaner_list.sort(key=lambda x: x["abs_pos"])
+
+    # One-to-one greedy matching: for each address, find the closest unused cleaner
+    used_cleaner_indices = set()
     rows = []
-    for addr in address_boxes:
-        best_cleaner = "Unassigned"
+
+    for addr in address_list:
+        best_idx = None
         best_dist = float("inf")
 
-        for c in cleaner_boxes:
-            if c["page"] != addr["page"]:
+        for i, c in enumerate(cleaner_list):
+            if i in used_cleaner_indices:
                 continue
-            dist = abs(c["y1"] - addr["y1"])
+            dist = abs(c["abs_pos"] - addr["abs_pos"])
             if dist < best_dist:
                 best_dist = dist
-                best_cleaner = c["cleaner"]
+                best_idx = i
 
-        # Only accept match if within ~60 points vertically
-        if best_dist > 60:
-            best_cleaner = "Unassigned"
+        # Accept match if within ~300 abs units (generous tolerance)
+        if best_idx is not None and best_dist <= 300:
+            cleaner = cleaner_list[best_idx]["cleaner"]
+            used_cleaner_indices.add(best_idx)
+        else:
+            cleaner = "Unassigned"
 
         rows.append({
-            "Cleaner": best_cleaner,
+            "Cleaner": cleaner,
             "Property Nickname": addr["address"],
         })
 
@@ -234,7 +221,7 @@ def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.drop_duplicates()
+    df = df.drop_duplicates(subset=["Property Nickname"])
     df["Cleaner"] = df["Cleaner"].fillna("Unassigned").astype(str).str.strip()
     df["Property Nickname"] = df["Property Nickname"].fillna("").astype(str).str.strip()
     return df[df["Property Nickname"] != ""]
