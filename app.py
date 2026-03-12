@@ -1,8 +1,9 @@
-import streamlit as st
-import gspread
-import pandas as pd
 import re
 from io import BytesIO
+
+import gspread
+import pandas as pd
+import streamlit as st
 from google.oauth2.service_account import Credentials
 from pypdf import PdfReader
 
@@ -13,7 +14,7 @@ st.set_page_config(page_title="Reporte de Llaves M", layout="wide")
 
 
 # ----------------------------------------------------------
-# 1. AUTENTICACIÓN GOOGLE SHEETS
+# 1. GOOGLE SHEETS
 # ----------------------------------------------------------
 def authorize_gspread():
     creds = st.secrets["gcp_service_account"]
@@ -47,7 +48,7 @@ def simplify_address_15chars(address: str) -> str:
 
 
 # ----------------------------------------------------------
-# 3. EXTRAER TEXTO DE PDF
+# 3. PDF A TEXTO
 # ----------------------------------------------------------
 def extract_text_from_pdf(pdf_file) -> str:
     reader = PdfReader(pdf_file)
@@ -76,6 +77,8 @@ def clean_line(line: str) -> str:
 
 
 def is_footer_or_header(line: str) -> bool:
+    line = clean_line(line)
+
     if not line:
         return True
 
@@ -87,142 +90,26 @@ def is_footer_or_header(line: str) -> bool:
         r"^Task$",
         r"^Reservation Assigned To$",
         r"^Brisbane$",
-        r"^Bedspoke Pty Ltd$",
-        r"^Address:$",
-        r"^Email:$",
-        r"^Phone:$",
+        r"^Bedspoke$",
+        r"^Bedspoke Pty Ltd",
+        r"^Address:",
+        r"^Email:",
+        r"^Phone:",
         r"^Printed by Resly$",
         r"^Page \d+ of \d+$",
         r"^\d{1,2} \w{3} \d{4} .* Printed by Resly Page \d+ of \d+$",
         r"^\d{1,2} \w{3} \d{4} \d{2}:\d{2}:\d{2}$",
-        r"^\d{1,2} \w{3} \d{4} \d{2}:\d{2}:\d{2} Printed by Resly Page \d+ of \d+$",
+        r"^\d{1,2} \w{3} \d{4} \d{2}:\d{2}:\d{2} \| Printed by Resly Page \d+ of \d+.*$",
     ]
 
     return any(re.search(p, line, flags=re.IGNORECASE) for p in patterns)
 
 
-# ----------------------------------------------------------
-# 5. DETECCIÓN DE DIRECCIONES
-# ----------------------------------------------------------
-def looks_like_address_start(line: str) -> bool:
-    """
-    Detecta inicio de propiedad.
-    Ej:
-    1/484 Upper Edward Street
-    92 Cricket Street
-    A71/41 Gotha Street
-    """
+def is_date_stay_line(line: str) -> bool:
     line = clean_line(line)
-
-    if not line:
-        return False
-
-    # Excluir fechas
-    if re.match(r"^\d{2}/\d{2}/\d{4}$", line):
-        return False
-
-    # Excluir rango de fechas de reservas
-    if re.search(r"\d{2}/\d{2}/\d{4}\s+to\s+\d{2}/\d{2}/\d{4}", line):
-        return False
-
-    # Debe comenzar parecido a número/unidad
-    starts_like_property = bool(
-        re.match(r"^[A-Za-z]?\d+[A-Za-z]?(?:/\d+[A-Za-z]?)?", line)
-    )
-
-    street_keywords = [
-        "Street", "St", "Road", "Rd", "Terrace", "Tce", "Lane", "Way",
-        "Quay", "Avenue", "Ave", "Grove", "Court", "Ct", "Boulevard",
-        "Bvd", "Drive", "Dr", "Place", "Pl", "Close", "Cl"
-    ]
-
-    has_street_word = any(k.lower() in line.lower() for k in street_keywords)
-
-    return starts_like_property and has_street_word
+    return bool(re.search(r"\d{2}/\d{2}/\d{4}\s+to\s+\d{2}/\d{2}/\d{4}", line))
 
 
-def is_address_continuation(line: str) -> bool:
-    """
-    Segunda línea de dirección, por ejemplo:
-    Spring Hill, QLD 4000
-    Brisbane City, QLD 4000
-    """
-    line = clean_line(line)
-
-    if not line:
-        return False
-
-    if looks_like_address_start(line):
-        return False
-
-    # No debe parecer línea operativa
-    forbidden_starts = [
-        "Scheduled",
-        "[D]",
-        "Due:",
-        "Departing",
-        "Arriving",
-        "Arrival",
-        "Back To Back",
-        "Unassigned",
-        "No Arrival Reservation",
-        "Welcome",
-        "Please",
-        "IMPORTANT",
-        "ETA:",
-    ]
-    if any(line.startswith(x) for x in forbidden_starts):
-        return False
-
-    # No debe ser guest stay date
-    if re.search(r"\d{2}/\d{2}/\d{4}\s+to\s+\d{2}/\d{2}/\d{4}", line):
-        return False
-
-    # Línea con suburbio / estado / postcode
-    if re.search(r"\bQLD\b|\bNSW\b|\bVIC\b|\bACT\b|\bWA\b|\bSA\b|\bTAS\b|\bNT\b|\b\d{4}\b", line, flags=re.IGNORECASE):
-        return True
-
-    # Texto tipo continuación
-    return bool(re.fullmatch(r"[A-Za-z0-9,.\- ]+", line))
-
-
-def build_address(lines, start_idx):
-    address_parts = [clean_line(lines[start_idx])]
-    i = start_idx + 1
-
-    while i < len(lines):
-        line = clean_line(lines[i])
-
-        if not line:
-            break
-
-        if is_footer_or_header(line):
-            break
-
-        if looks_like_address_start(line):
-            break
-
-        if is_address_continuation(line):
-            address_parts.append(line)
-            i += 1
-
-            # Si ya tiene postcode, normalmente está completa
-            if re.search(r"\b\d{4}\b", " ".join(address_parts)):
-                break
-            continue
-
-        break
-
-    address = " ".join(address_parts)
-    address = re.sub(r"\s+,", ",", address)
-    address = re.sub(r"\s{2,}", " ", address).strip()
-
-    return address, i
-
-
-# ----------------------------------------------------------
-# 6. DETECCIÓN DE CLEANER
-# ----------------------------------------------------------
 def is_guest_line(line: str) -> bool:
     line = clean_line(line)
     return bool(re.search(r"\([0-9]+A[0-9]+C\)", line))
@@ -233,11 +120,16 @@ def is_operation_line(line: str) -> bool:
 
     bad_exact = {
         "Scheduled",
+        "In House",
+        "Done",
         "[D] Depart Clean",
         "[D] Depart",
         "Clean",
         "Departing",
+        "Departing Today",
+        "Departure",
         "Arriving",
+        "Arriving Today",
         "Arrival",
         "Back To Back",
         "Due:",
@@ -256,6 +148,7 @@ def is_operation_line(line: str) -> bool:
         r"^\d+N$",
         r"^ETA:",
         r"^Welcome and enjoy your stay",
+        r"^Welcome and Happy birthday",
         r"^Please ",
         r"^Departure Time:",
         r"^There was a long stay",
@@ -264,13 +157,120 @@ def is_operation_line(line: str) -> bool:
         r"^return the",
         r"^pls return",
         r"^DEEP CLEAN",
-        r"^Printed by Resly",
-        r"^Housekeeping Tasks",
+        r"^Guest requested",
+        r"^G feedback",
+        r"^11am ",
+        r"^10:30am ",
+        r"^12nn$",
+        r"^3pm$",
+        r"^8am$",
+        r"^3PM$",
+        r"^2:30pm$",
     ]
-
     return any(re.search(p, line, flags=re.IGNORECASE) for p in bad_patterns)
 
 
+# ----------------------------------------------------------
+# 5. DETECCIÓN DE DIRECCIONES
+# ----------------------------------------------------------
+def looks_like_address_start(line: str) -> bool:
+    line = clean_line(line)
+
+    if not line:
+        return False
+
+    if is_footer_or_header(line):
+        return False
+
+    if is_date_stay_line(line):
+        return False
+
+    # Ejemplos:
+    # 11/484 Upper Edward Street
+    # 2002/191 Brunswick Street
+    # A71/41 Gotha Street
+    # 24 Church Street
+    starts_like_property = bool(
+        re.match(r"^[A-Za-z]?\d+[A-Za-z]?(?:/\d+[A-Za-z]?)?", line)
+    )
+
+    street_keywords = [
+        "Street", "St", "Road", "Rd", "Terrace", "Tce", "Lane", "Way",
+        "Quay", "Avenue", "Ave", "Grove", "Court", "Ct", "Boulevard",
+        "Bvd", "Drive", "Dr", "Place", "Pl", "Close", "Cl"
+    ]
+
+    has_street_word = any(k.lower() in line.lower() for k in street_keywords)
+
+    return starts_like_property and has_street_word
+
+
+def is_address_continuation(line: str) -> bool:
+    line = clean_line(line)
+
+    if not line:
+        return False
+
+    if looks_like_address_start(line):
+        return False
+
+    if is_footer_or_header(line):
+        return False
+
+    if is_operation_line(line):
+        return False
+
+    if is_date_stay_line(line):
+        return False
+
+    if is_guest_line(line):
+        return False
+
+    if re.search(
+        r"\bQLD\b|\bNSW\b|\bVIC\b|\bACT\b|\bWA\b|\bSA\b|\bTAS\b|\bNT\b|\b\d{4}\b",
+        line,
+        flags=re.IGNORECASE,
+    ):
+        return True
+
+    return bool(re.fullmatch(r"[A-Za-z0-9,.\- ]+", line))
+
+
+def build_address(lines, start_idx):
+    parts = [clean_line(lines[start_idx])]
+    i = start_idx + 1
+
+    while i < len(lines):
+        line = clean_line(lines[i])
+
+        if not line:
+            break
+
+        if is_footer_or_header(line):
+            break
+
+        if looks_like_address_start(line):
+            break
+
+        if is_address_continuation(line):
+            parts.append(line)
+            i += 1
+            if re.search(r"\b\d{4}\b", " ".join(parts)):
+                break
+            continue
+
+        break
+
+    address = " ".join(parts)
+    address = re.sub(r"\s+,", ",", address)
+    address = re.sub(r"\s{2,}", " ", address).strip()
+
+    return address, i
+
+
+# ----------------------------------------------------------
+# 6. DETECCIÓN DE NOMBRE
+# ----------------------------------------------------------
 def is_cleaner_name_line(line: str) -> bool:
     line = clean_line(line)
 
@@ -286,19 +286,23 @@ def is_cleaner_name_line(line: str) -> bool:
     if is_guest_line(line):
         return False
 
-    # Excluir fechas o números
+    if is_date_stay_line(line):
+        return False
+
+    # Excluir líneas con números
     if re.search(r"\d", line):
         return False
 
-    # Excluir formatos de huésped
+    # Excluir formatos típicos de huéspedes o ruido
     if "," in line or "(" in line or ")" in line:
         return False
 
-    # Excluir frases largas operativas disfrazadas
     banned_fragments = [
         "reservation",
         "arrival",
+        "arriving",
         "depart",
+        "departure",
         "check",
         "guest",
         "housekeeping",
@@ -306,12 +310,18 @@ def is_cleaner_name_line(line: str) -> bool:
         "resly",
         "welcome",
         "bedspoke",
+        "clean",
+        "done",
+        "scheduled",
+        "unassigned",
+        "back to back",
+        "due",
+        "eta",
     ]
     low = line.lower()
     if any(x in low for x in banned_fragments):
         return False
 
-    # Solo letras/espacios/apóstrofes/guiones
     if not re.fullmatch(r"[A-Za-zÀ-ÿ'’\- ]+", line):
         return False
 
@@ -319,60 +329,51 @@ def is_cleaner_name_line(line: str) -> bool:
     return 1 <= len(words) <= 6
 
 
-def extract_cleaner_from_block(block_lines):
+def extract_cleaner_above_address(lines, start_idx):
     """
-    Busca el cleaner desde el final del bloque hacia arriba.
-    Permite nombres partidos en varias líneas.
+    Busca el cleaner inmediatamente ARRIBA de la dirección.
+    En este PDF, el assigned person suele venir justo antes de la address.
     """
-    cleaned = [clean_line(x) for x in block_lines if clean_line(x)]
+    parts = []
+    i = start_idx - 1
 
-    # Limpiar basura del final
-    while cleaned and (is_footer_or_header(cleaned[-1]) or is_operation_line(cleaned[-1])):
-        cleaned.pop()
-
-    if not cleaned:
-        return "Unassigned"
-
-    name_parts = []
-    i = len(cleaned) - 1
-
+    # saltar basura operativa justo antes de la dirección
     while i >= 0:
-        line = cleaned[i]
+        line = clean_line(lines[i])
+
+        if not line or is_footer_or_header(line):
+            i -= 1
+            continue
+
+        if is_operation_line(line) or is_guest_line(line) or is_date_stay_line(line):
+            i -= 1
+            continue
+
+        break
+
+    # recoger 1 a 4 líneas de nombre hacia arriba
+    while i >= 0:
+        line = clean_line(lines[i])
 
         if is_cleaner_name_line(line):
-            name_parts.insert(0, line)
+            parts.insert(0, line)
             i -= 1
-        else:
-            if name_parts:
+            if len(parts) >= 4:
                 break
-            i -= 1
+        else:
+            break
 
-    cleaner = " ".join(name_parts)
+    cleaner = " ".join(parts)
     cleaner = re.sub(r"\s{2,}", " ", cleaner).strip()
 
     if not cleaner:
-        return "Unassigned"
-
-    bad_cleaners = {
-        "Back To Back",
-        "Departing",
-        "Arriving",
-        "Scheduled",
-        "Due",
-        "Due:",
-        "Property Housekeeping",
-        "Task",
-        "Reservation Assigned To",
-    }
-
-    if cleaner in bad_cleaners:
         return "Unassigned"
 
     return cleaner
 
 
 # ----------------------------------------------------------
-# 7. PARSEAR PDF HOUSEKEEPING
+# 7. PARSER PRINCIPAL DEL PDF
 # ----------------------------------------------------------
 def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
     text = extract_text_from_pdf(pdf_file)
@@ -395,24 +396,14 @@ def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
 
         if looks_like_address_start(line):
             address, next_i = build_address(lines, i)
-
-            block = []
-            j = next_i
-
-            while j < len(lines):
-                if looks_like_address_start(lines[j]):
-                    break
-                block.append(lines[j])
-                j += 1
-
-            cleaner = extract_cleaner_from_block(block)
+            cleaner = extract_cleaner_above_address(lines, i)
 
             rows.append({
                 "Cleaner": cleaner,
                 "Property Nickname": address
             })
 
-            i = j
+            i = next_i
         else:
             i += 1
 
@@ -423,11 +414,9 @@ def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
 
     df = df.drop_duplicates()
 
-    # Limpieza extra
     df["Cleaner"] = df["Cleaner"].fillna("Unassigned").astype(str).str.strip()
     df["Property Nickname"] = df["Property Nickname"].fillna("").astype(str).str.strip()
 
-    # Quitar filas vacías
     df = df[df["Property Nickname"] != ""]
 
     return df
@@ -462,23 +451,19 @@ def load_key_register() -> pd.DataFrame:
 
 
 # ----------------------------------------------------------
-# 9. GENERAR REPORTE EXCEL
+# 9. GENERAR REPORTE
 # ----------------------------------------------------------
 def create_grouped_excel_from_pdf(pdf_file):
     df_pdf = parse_housekeeping_pdf(pdf_file)
 
     if df_pdf.empty:
-        raise ValueError(
-            "No pude extraer propiedades del PDF. Revisa si el formato cambió."
-        )
+        raise ValueError("No pude extraer propiedades del PDF. Revisa si cambió el formato.")
 
     df_keys = load_key_register()
 
-    # Simplificar direcciones
     df_pdf["Simplified"] = df_pdf["Property Nickname"].apply(simplify_address_15chars)
     df_keys["Simplified"] = df_keys["Property Address"].apply(simplify_address_15chars)
 
-    # Merge
     merged = pd.merge(
         df_pdf,
         df_keys,
@@ -487,12 +472,10 @@ def create_grouped_excel_from_pdf(pdf_file):
         suffixes=("_PDF", "_Key")
     )
 
-    # Solo llaves M
     merged["Llave M"] = merged["Tag"].apply(
         lambda x: x if pd.notna(x) and str(x).strip().upper().startswith("M") else ""
     )
 
-    # Reporte base
     df_report = merged[["Cleaner", "Property Nickname", "Llave M"]].rename(columns={
         "Cleaner": "Encargado",
         "Property Nickname": "Dirección"
@@ -504,7 +487,6 @@ def create_grouped_excel_from_pdf(pdf_file):
 
     df_report = df_report[df_report["Dirección"] != ""]
 
-    # Agrupar por encargado + dirección
     grouped = (
         df_report.groupby(["Encargado", "Dirección"], as_index=False)
         .agg({
@@ -515,7 +497,6 @@ def create_grouped_excel_from_pdf(pdf_file):
 
     grouped = grouped[["Dirección", "Encargado", "Llave M"]]
 
-    # Crear Excel
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -524,9 +505,6 @@ def create_grouped_excel_from_pdf(pdf_file):
         merged.to_excel(writer, sheet_name="Merge_Debug", index=False)
 
         workbook = writer.book
-        ws_report = writer.sheets["Reporte"]
-        ws_pdf = writer.sheets["Extraido_PDF"]
-        ws_merge = writer.sheets["Merge_Debug"]
 
         header_fmt = workbook.add_format({
             "bold": True,
@@ -550,7 +528,10 @@ def create_grouped_excel_from_pdf(pdf_file):
             "valign": "vcenter"
         })
 
-        # Encabezados Reporte
+        ws_report = writer.sheets["Reporte"]
+        ws_pdf = writer.sheets["Extraido_PDF"]
+        ws_merge = writer.sheets["Merge_Debug"]
+
         for col, name in enumerate(grouped.columns):
             ws_report.write(0, col, name, header_fmt)
 
@@ -561,13 +542,11 @@ def create_grouped_excel_from_pdf(pdf_file):
         for row in range(1, len(grouped) + 1):
             ws_report.set_row(row, None, band_fmt if row % 2 == 0 else cell_fmt)
 
-        # Extraido_PDF
         for col, name in enumerate(df_pdf.columns):
             ws_pdf.write(0, col, name, header_fmt)
         ws_pdf.set_column("A:A", 30)
-        ws_pdf.set_column("B:B", 50)
+        ws_pdf.set_column("B:B", 55)
 
-        # Merge_Debug
         for col, name in enumerate(merged.columns):
             ws_merge.write(0, col, name, header_fmt)
         ws_merge.set_column(0, len(merged.columns) - 1, 22)
@@ -577,7 +556,7 @@ def create_grouped_excel_from_pdf(pdf_file):
 
 
 # ----------------------------------------------------------
-# 10. INTERFAZ STREAMLIT
+# 10. UI
 # ----------------------------------------------------------
 st.title("🗝️ Reporte de Llaves M desde PDF")
 st.write("Sube el PDF de Housekeeping Daily Summary para cruzarlo con tu Key Register.")
@@ -590,12 +569,12 @@ if pdf_file:
 
         st.success("✅ Reporte generado correctamente")
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Trabajos detectados en PDF", len(extracted_df))
-        col2.metric("Filas reporte final", len(grouped_df))
-        col3.metric("Cruces totales", len(merged_df))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Trabajos detectados en PDF", len(extracted_df))
+        c2.metric("Filas reporte final", len(grouped_df))
+        c3.metric("Cruces totales", len(merged_df))
 
-        st.subheader("Vista previa: propiedades y cleaners detectados desde el PDF")
+        st.subheader("Vista previa: extraído del PDF")
         st.dataframe(extracted_df, use_container_width=True)
 
         st.subheader("Reporte final")
