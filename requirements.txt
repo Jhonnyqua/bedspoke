@@ -1,5 +1,6 @@
-streamlit
-gspread
-pandas
-google-auth
+pypdf
 xlsxwriter
+gspread
+google-auth
+pandas
+streamlit
