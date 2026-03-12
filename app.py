@@ -6,9 +6,8 @@ import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
 
-# Use pdfminer instead of pypdf for correct multi-column extraction
-from pdfminer.high_level import extract_text
-from pdfminer.layout import LAParams
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LTTextBox, LTTextLine, LTChar, LAParams
 
 st.set_page_config(page_title="Reporte de Llaves M", layout="wide")
 
@@ -18,8 +17,6 @@ STREET_KEYWORDS = [
     "Bvd", "Drive", "Dr", "Place", "Pl", "Close", "Cl"
 ]
 
-# Banned words for cleaner name detection - checked with WORD BOUNDARY
-# to avoid rejecting names like Caetano (eta), Quintana (eta), Ibieta (eta)
 BANNED_NAME_WORDS = [
     "reservation", "arrival", "arriving", "depart", "departure",
     "check", "guest", "housekeeping", "printed", "resly", "welcome",
@@ -60,19 +57,49 @@ def simplify_address_15chars(address: str) -> str:
 
 
 # ----------------------------------------------------------
-# PDF A TEXTO — usa pdfminer con boxes_flow=-1
-# boxes_flow=-1 = lectura estrictamente de arriba hacia abajo por columna,
-# evitando que pypdf fusione columnas en una sola línea.
+# PDF EXTRACTION — LEFT COLUMN ONLY BY X COORDINATE
 # ----------------------------------------------------------
-def extract_text_from_pdf(pdf_file) -> str:
-    laparams = LAParams(
-        boxes_flow=-1,       # -1 = top-to-bottom column reading (no horizontal merge)
-        line_margin=0.3,
-        char_margin=3.0,
-        word_margin=0.1,
-        line_overlap=0.5,
-    )
-    return extract_text(pdf_file, laparams=laparams)
+def extract_left_column_lines(pdf_file) -> list:
+    """
+    Extract text elements from the LEFT column only, using X coordinates.
+    The PDF has 3 columns:
+      Left (~x < 40% of page width):  Property address + cleaner name  ← we want this
+      Middle:                          Task info (Scheduled, Due, etc.)
+      Right:                           Reservation/guest info
+    We collect text boxes whose left edge (x0) is in the left portion of the page,
+    sort them top-to-bottom, and return as lines.
+    """
+    laparams = LAParams(line_margin=0.5, char_margin=3.0, word_margin=0.1)
+
+    all_elements = []  # list of (page_num, y_top, x0, text)
+
+    for page_num, page_layout in enumerate(extract_pages(pdf_file, laparams=laparams)):
+        page_width = page_layout.width
+        # Left column threshold: anything starting in the left ~38% of the page
+        left_threshold = page_width * 0.38
+
+        for element in page_layout:
+            if isinstance(element, LTTextBox):
+                x0 = element.x0
+                # Only keep elements from the left column
+                if x0 < left_threshold:
+                    text = element.get_text().strip()
+                    if text:
+                        y_top = element.y1  # top of the element (higher = higher on page)
+                        all_elements.append((page_num, y_top, x0, text))
+
+    # Sort by page, then by y descending (top of page first)
+    all_elements.sort(key=lambda e: (e[0], -e[1]))
+
+    # Split each text box into individual lines
+    lines = []
+    for _, _, _, text in all_elements:
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                lines.append(line)
+
+    return lines
 
 
 # ----------------------------------------------------------
@@ -148,22 +175,8 @@ def looks_like_address_start(line: str, next_line: str = "") -> bool:
         return False
     if not re.match(r"^[A-Za-z]?\d+[A-Za-z]?(?:/\d+[A-Za-z]?)?", line):
         return False
-    # Check street keyword in current line OR next line (pypdf may split them)
     combined = line + " " + clean_line(next_line)
     return any(k.lower() in combined.lower() for k in STREET_KEYWORDS)
-
-
-def trim_address_at_postcode(address: str) -> str:
-    """
-    When pypdf/pdfminer merges columns, operational text can be glued to
-    the end of an address: 'QLD 4007Scheduled' or 'QLD 4007 Scheduled...'.
-    This cuts the address right after the 4-digit Australian postcode.
-    """
-    # Australian postcodes: 4 digits starting with 2, 3, 4, 5, 6, 7, 8, 9
-    m = re.search(r"\b([2-9]\d{3})", address)
-    if m:
-        return address[:m.start() + 4].strip()
-    return address.strip()
 
 
 def build_address(lines, start_idx):
@@ -193,8 +206,6 @@ def build_address(lines, start_idx):
 
     address = re.sub(r"\s+,", ",", " ".join(parts))
     address = re.sub(r"\s{2,}", " ", address).strip()
-    # Trim anything glued after the postcode (column merge artifact)
-    address = trim_address_at_postcode(address)
     return address, i
 
 
@@ -202,10 +213,6 @@ def build_address(lines, start_idx):
 # DETECCIÓN DE NOMBRE DEL CLEANER
 # ----------------------------------------------------------
 def is_cleaner_name_line(line: str) -> bool:
-    """
-    FIX: Use word-boundary matching for banned words so names like
-    Caetano, Quintana, Ibieta (all contain 'eta') are not rejected.
-    """
     line = clean_line(line)
     if not line:
         return False
@@ -219,11 +226,9 @@ def is_cleaner_name_line(line: str) -> bool:
         return False
 
     low = line.lower()
-    # Word-boundary check for single banned words
     for word in BANNED_NAME_WORDS:
         if re.search(r"\b" + re.escape(word) + r"\b", low):
             return False
-    # Substring check for phrases
     for phrase in BANNED_NAME_PHRASES:
         if phrase in low:
             return False
@@ -231,15 +236,10 @@ def is_cleaner_name_line(line: str) -> bool:
     if not re.fullmatch(r"[A-Za-z\xc0-\xff''\- ]+", line):
         return False
 
-    words = line.split()
-    return 1 <= len(words) <= 6
+    return 1 <= len(line.split()) <= 6
 
 
 def extract_cleaner_from_block(block_lines: list) -> str:
-    """
-    The cleaner name appears at the TAIL of the property block,
-    just before the next address. Collects all name-looking lines.
-    """
     name_parts = [clean_line(l) for l in block_lines if is_cleaner_name_line(l)]
     if not name_parts:
         return "Unassigned"
@@ -250,8 +250,9 @@ def extract_cleaner_from_block(block_lines: list) -> str:
 # PARSER PRINCIPAL
 # ----------------------------------------------------------
 def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
-    text = extract_text_from_pdf(pdf_file)
-    all_lines = [clean_line(l) for l in text.splitlines() if clean_line(l)]
+    # Extract ONLY the left column lines (address + cleaner name)
+    raw_lines = extract_left_column_lines(pdf_file)
+    all_lines = [clean_line(l) for l in raw_lines if clean_line(l)]
 
     # Pass 1: locate all addresses
     address_entries = []
@@ -269,7 +270,7 @@ def parse_housekeeping_pdf(pdf_file) -> pd.DataFrame:
         else:
             i += 1
 
-    # Pass 2: cleaner = name lines in block AFTER this address, BEFORE next address
+    # Pass 2: cleaner = name lines in block AFTER address, BEFORE next address
     rows = []
     for idx, entry in enumerate(address_entries):
         block_start = entry["addr_end"]
