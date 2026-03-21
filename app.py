@@ -162,7 +162,6 @@ def score_address_match(pdf_addr: str, key_addr: str) -> float:
     token_overlap = len(p["tokens"] & k["tokens"])
     score += min(token_overlap * 5, 20)
 
-    # bonus por simplificación corta exacta
     if simplify_address_15chars(pdf_addr) == simplify_address_15chars(key_addr):
         score += 10
 
@@ -190,6 +189,34 @@ def find_best_match(pdf_addr: str, df_keys: pd.DataFrame):
     candidates = sorted(candidates, key=lambda x: x["score"], reverse=True)
     best = candidates[0]
     return best, candidates[:3]
+
+
+def get_m_keys_for_address(matched_address: str, df_keys: pd.DataFrame) -> str:
+    """
+    Devuelve todas las llaves M asociadas a la propiedad matcheada.
+    """
+    if not matched_address:
+        return ""
+
+    target_norm = normalize_address(matched_address)
+    target_simple = simplify_address_15chars(matched_address)
+
+    subset = df_keys.copy()
+    subset["__norm"] = subset["Property Address"].astype(str).apply(normalize_address)
+    subset["__simple"] = subset["Property Address"].astype(str).apply(simplify_address_15chars)
+
+    matched_rows = subset[
+        (subset["__norm"] == target_norm) |
+        (subset["__simple"] == target_simple)
+    ].copy()
+
+    if matched_rows.empty:
+        return ""
+
+    tags = matched_rows["Tag"].fillna("").astype(str).str.strip()
+    m_tags = sorted({tag for tag in tags if tag.upper().startswith("M")})
+
+    return ", ".join(m_tags)
 
 
 # ----------------------------------------------------------
@@ -290,7 +317,10 @@ def call_gpt_page(img_b64: str, page_num: int) -> list:
     )
 
     if response.status_code != 200:
-        err = response.json().get("error", {}).get("message", response.text)
+        try:
+            err = response.json().get("error", {}).get("message", response.text)
+        except Exception:
+            err = response.text
         raise ValueError(f"Error API GPT página {page_num}: {response.status_code} — {err}")
 
     raw = response.json()["choices"][0]["message"]["content"].strip()
@@ -417,6 +447,7 @@ def build_matches(df_pdf: pd.DataFrame, df_keys: pd.DataFrame):
 
         final_address = ""
         final_tag = ""
+        final_m_keys = ""
         match_score = 0
         match_method = "none"
         review_reason = ""
@@ -452,13 +483,15 @@ def build_matches(df_pdf: pd.DataFrame, df_keys: pd.DataFrame):
                 review_reason = "Low score"
 
         if final_address:
+            final_m_keys = get_m_keys_for_address(final_address, df_keys)
+
             matched_rows.append({
                 **pdf_row.to_dict(),
                 "Matched Address": final_address,
-                "Tag": final_tag,
+                "Matched Tag": final_tag,
                 "Match Score": match_score,
                 "Match Method": match_method,
-                "Llave M": final_tag if str(final_tag).strip().upper().startswith("M") else "",
+                "Llave M": final_m_keys,
             })
         else:
             top_candidates_str = " | ".join(
@@ -506,24 +539,28 @@ def create_report_excel(pdf_bytes: bytes, progress_bar):
     progress_bar.progress(0.80, text="Haciendo match inteligente...")
     matched_df, review_df = build_matches(df_pdf, df_keys)
 
+    if matched_df.empty and review_df.empty:
+        raise ValueError("No se pudo construir ningún resultado. Revisa el PDF y el Key Register.")
+
     if matched_df.empty:
-        raise ValueError("No se logró hacer ningún match. Revisa la extracción o el Key Register.")
+        st.warning("No hubo matches finales. Revisa la hoja Review_Needed.")
+        grouped = pd.DataFrame(columns=["Dirección", "Encargado", "Llave M"])
+    else:
+        df_report = matched_df[["Cleaner", "Property Nickname", "Llave M"]].rename(
+            columns={"Cleaner": "Encargado", "Property Nickname": "Dirección"}
+        )
 
-    df_report = matched_df[["Cleaner", "Property Nickname", "Llave M"]].rename(
-        columns={"Cleaner": "Encargado", "Property Nickname": "Dirección"}
-    )
+        df_report = df_report.fillna("").astype(str)
+        df_report["Encargado"] = df_report["Encargado"].str.strip().replace("", "Unassigned")
+        df_report["Dirección"] = df_report["Dirección"].str.strip()
+        df_report["Llave M"] = df_report["Llave M"].str.strip()
+        df_report = df_report[df_report["Dirección"] != ""]
 
-    df_report = df_report.fillna("").astype(str)
-    df_report["Encargado"] = df_report["Encargado"].str.strip().replace("", "Unassigned")
-    df_report["Dirección"] = df_report["Dirección"].str.strip()
-    df_report["Llave M"] = df_report["Llave M"].str.strip()
-    df_report = df_report[df_report["Dirección"] != ""]
-
-    grouped = (
-        df_report.groupby(["Encargado", "Dirección"], as_index=False)
-        .agg({"Llave M": lambda x: ", ".join(sorted({v.strip() for v in x if v.strip()}))})
-        .sort_values(["Encargado", "Dirección"])
-    )[["Dirección", "Encargado", "Llave M"]]
+        grouped = (
+            df_report.groupby(["Encargado", "Dirección"], as_index=False)
+            .agg({"Llave M": lambda x: ", ".join(sorted({v.strip() for v in x if v.strip()}))})
+            .sort_values(["Encargado", "Dirección"])
+        )[["Dirección", "Encargado", "Llave M"]]
 
     progress_bar.progress(0.92, text="Generando Excel...")
 
@@ -531,6 +568,14 @@ def create_report_excel(pdf_bytes: bytes, progress_bar):
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         grouped.to_excel(writer, sheet_name="Reporte", index=False)
         df_pdf.to_excel(writer, sheet_name="Extraido_PDF", index=False)
+
+        if matched_df.empty:
+            matched_df = pd.DataFrame(columns=[
+                "Cleaner", "Property Nickname", "page",
+                "address_confidence", "cleaner_confidence", "notes",
+                "Matched Address", "Matched Tag", "Match Score",
+                "Match Method", "Llave M"
+            ])
         matched_df.to_excel(writer, sheet_name="Matched_Debug", index=False)
 
         if review_df.empty:
@@ -600,13 +645,14 @@ def create_report_excel(pdf_bytes: bytes, progress_bar):
 # UI
 # ----------------------------------------------------------
 st.title("🗝️ Reporte de Llaves M desde PDF")
-st.caption("Lectura visual con IA + matching inteligente + revisión de casos dudosos.")
+st.caption("Lectura visual con IA + matching inteligente + recuperación de todas las llaves M por propiedad.")
 
 pdf_file = st.file_uploader("📥 Sube tu PDF", type=["pdf"])
 
 if pdf_file:
     if st.button("🚀 Generar Reporte", type="primary"):
         progress = st.progress(0, text="Iniciando...")
+
         try:
             pdf_bytes = pdf_file.read()
 
@@ -619,8 +665,8 @@ if pdf_file:
 
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Trabajos detectados", len(extracted_df))
-            c2.metric("Matches automáticos/finales", len(matched_df))
-            c3.metric("Pendientes de revisión", len(review_df))
+            c2.metric("Matches finales", len(matched_df))
+            c3.metric("Pendientes revisión", len(review_df))
             c4.metric("Filas reporte final", len(grouped_df))
 
             st.subheader("Vista previa: extraído del PDF")
