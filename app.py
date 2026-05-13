@@ -192,9 +192,6 @@ def find_best_match(pdf_addr: str, df_keys: pd.DataFrame):
 
 
 def get_m_keys_for_address(matched_address: str, df_keys: pd.DataFrame) -> str:
-    """
-    Devuelve todas las llaves M asociadas a la propiedad matcheada.
-    """
     if not matched_address:
         return ""
 
@@ -241,27 +238,42 @@ def pdf_to_base64_images(pdf_bytes: bytes) -> list:
 
 
 # ----------------------------------------------------------
-# GPT EXTRACTION
+# FIX 1: PROMPT MEJORADO
 # ----------------------------------------------------------
-PROMPT = """Esta es una página de un reporte "Housekeeping Daily Summary".
+PROMPT = """Esta es una página de un "Housekeeping Daily Summary" de Resly/Bedspoke.
 
-Extraé CADA propiedad visible en la página.
+Cada propiedad tiene este formato típico:
+- Dirección (en negrita o destacada, con número de unidad/piso y calle)
+- Tipo de tarea (Depart Clean, Service Clean, etc.)
+- Detalles de reservas (nombres de HUÉSPEDES con fechas)
+- NOTAS internas (instrucciones de limpieza, llaves, etc.)
+- Nombre del cleaner asignado (columna "Assigned To", al final de la fila)
+
+REGLAS CRÍTICAS para identificar el cleaner:
+1. El cleaner asignado es el nombre que aparece en la columna "Assigned To" del reporte.
+   Generalmente aparece al final del bloque de cada propiedad, alineado a la derecha.
+2. NUNCA uses nombres que aparecen en las notas internas como cleaner.
+   Las notas contienen instrucciones como "pls return M set to base - Marga" o 
+   "(Ricka Joy Mangi-07/05/26)" — estos son AUTORES DE NOTAS, NO cleaners.
+3. NUNCA uses nombres de huéspedes (van con fechas de reserva, como "SMITH, John (2A0C)").
+4. Si no hay cleaner asignado, devolvé exactamente "Unassigned".
+
+REGLAS para direcciones:
+- La dirección siempre empieza con un número de unidad/piso seguido de "/" y luego 
+  el número de calle. Ejemplo: "1208/35 Hercules Street" o "2/71 Doggett Street".
+- Si una dirección aparece cortada o incompleta al final de la página, devolvela igual 
+  con lo que puedas leer. NO la inventes ni completes.
+- Ignorá encabezados, pies de página, fechas y textos de reserva.
 
 Para cada propiedad devolvé:
-- address: dirección completa lo mejor posible
-- cleaner: nombre del cleaner asignado
+- address: dirección completa
+- cleaner: nombre del cleaner de la columna "Assigned To"
 - page: número de página
 - address_confidence: número entre 0 y 1
 - cleaner_confidence: número entre 0 y 1
 - notes: texto corto si hubo ambigüedad, o ""
 
-REGLAS:
-- Si el cleaner figura como "Unassigned", devolvé exactamente "Unassigned".
-- No confundas huéspedes con cleaners.
-- Ignorá encabezados, pies de página, fechas, reservas, ETA, comentarios, notas internas y nombres de huéspedes.
-- Si una dirección está fragmentada en varias líneas, unila.
-- Si una dirección quedó incompleta, devolvela igual, no inventes.
-- Respondé SOLO con JSON válido en esta forma:
+Respondé SOLO con JSON válido:
 {
   "records": [
     {
@@ -274,8 +286,7 @@ REGLAS:
     }
   ]
 }
-Si no hay propiedades, respondé:
-{"records": []}
+Si no hay propiedades visibles, respondé: {"records": []}
 """
 
 
@@ -368,6 +379,66 @@ def call_gpt_page(img_b64: str, page_num: int) -> list:
     return cleaned
 
 
+# ----------------------------------------------------------
+# FIX 2: FUSIONAR REGISTROS CON DIRECCIÓN CORTADA ENTRE PÁGINAS
+# ----------------------------------------------------------
+def _looks_like_address_fragment(addr: str) -> bool:
+    """
+    Devuelve True si la cadena parece un fragmento de dirección, no una dirección completa.
+    Señales: no empieza con dígito ni con patrón unit/number, o es solo suburb/estado.
+    """
+    addr = addr.strip()
+    if not addr:
+        return True
+    # Una dirección válida debe empezar con dígito (ej "1208/35") o letra+dígito (ej "A1/35")
+    if re.match(r"^[A-Za-z]?\d", addr):
+        return False
+    # Si empieza con letra pura, es un fragmento (ej "City Q 4000", "Street, South Brisbane...")
+    return True
+
+
+def merge_cross_page_fragments(records: list) -> list:
+    """
+    Detecta registros cuya dirección es un fragmento (no empieza con número)
+    y los fusiona con el registro anterior, que probablemente tenía la dirección cortada.
+    """
+    if not records:
+        return records
+
+    merged = []
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        addr = rec.get("address", "").strip()
+
+        # Si este registro es un fragmento Y hay un registro anterior en merged
+        if _looks_like_address_fragment(addr) and merged:
+            prev = merged[-1]
+            prev_addr = prev.get("address", "").strip()
+
+            # Solo fusionar si están en páginas consecutivas
+            if rec.get("page", 0) == prev.get("page", 0) + 1:
+                fused_address = (prev_addr + " " + addr).strip()
+                prev["address"] = fused_address
+                prev["address_confidence"] = min(
+                    prev.get("address_confidence", 1.0),
+                    rec.get("address_confidence", 1.0),
+                )
+                prev["notes"] = (
+                    (prev.get("notes", "") + " [dirección fusionada entre páginas]").strip()
+                )
+                # Si el registro anterior no tenía cleaner pero este sí, usarlo
+                if prev.get("cleaner", "Unassigned") == "Unassigned" and rec.get("cleaner", "Unassigned") != "Unassigned":
+                    prev["cleaner"] = rec["cleaner"]
+                i += 1
+                continue
+
+        merged.append(rec)
+        i += 1
+
+    return merged
+
+
 def extract_all_pages(images: list, progress_bar) -> list:
     all_records = []
     n = len(images)
@@ -378,6 +449,9 @@ def extract_all_pages(images: list, progress_bar) -> list:
         progress_bar.progress(min(pct, 0.63), text=f"Leyendo página {page_num} de {n} con IA...")
         records = call_gpt_page(img, page_num)
         all_records.extend(records)
+
+    # FIX 2: fusionar fragmentos de dirección que cruzan páginas
+    all_records = merge_cross_page_fragments(all_records)
 
     return all_records
 
@@ -606,7 +680,6 @@ def create_report_excel(pdf_bytes: bytes, progress_bar):
             "valign": "vcenter",
         })
 
-        # Reporte
         ws = writer.sheets["Reporte"]
         for col, name in enumerate(grouped.columns):
             ws.write(0, col, name, hdr)
@@ -616,7 +689,6 @@ def create_report_excel(pdf_bytes: bytes, progress_bar):
         for row in range(1, len(grouped) + 1):
             ws.set_row(row, None, alt if row % 2 == 0 else cel)
 
-        # Extraido_PDF
         ws2 = writer.sheets["Extraido_PDF"]
         for col, name in enumerate(df_pdf.columns):
             ws2.write(0, col, name, hdr)
@@ -624,13 +696,11 @@ def create_report_excel(pdf_bytes: bytes, progress_bar):
         ws2.set_column("B:B", 28)
         ws2.set_column("C:F", 18)
 
-        # Matched_Debug
         ws3 = writer.sheets["Matched_Debug"]
         for col, name in enumerate(matched_df.columns):
             ws3.write(0, col, name, hdr)
         ws3.set_column(0, len(matched_df.columns) - 1, 24)
 
-        # Review_Needed
         ws4 = writer.sheets["Review_Needed"]
         for col, name in enumerate(review_df.columns):
             ws4.write(0, col, name, hdr)
